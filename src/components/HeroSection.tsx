@@ -48,10 +48,10 @@ const HeroSection = () => {
 
         {/* CTA Buttons */}
         <div className="flex flex-col sm:flex-row gap-4 justify-center">
-          <Button variant="hero" size="lg">
-            Download for iOS
+          <Button variant="hero" size="lg" onClick={() => window.location.href = '/app'}>
+            Launch Tornado Tracker
           </Button>
-          <Button variant="storm" size="lg">
+          <Button variant="storm" size="lg" onClick={() => window.location.href = '#features'}>
             View Features
           </Button>
         </div>
