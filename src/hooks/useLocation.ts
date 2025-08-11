@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { toast } from '@/hooks/use-toast';
+import { LocationDataSchema, validateAndSanitizeStoredData, sanitizeNumber } from '@/lib/validation';
 
 export interface LocationData {
   latitude: number;
@@ -51,23 +52,30 @@ export const useLocation = () => {
       });
 
       const locationData: LocationData = {
-        latitude: position.coords.latitude,
-        longitude: position.coords.longitude,
-        accuracy: position.coords.accuracy,
+        latitude: sanitizeNumber(position.coords.latitude, position.coords.latitude, -90, 90),
+        longitude: sanitizeNumber(position.coords.longitude, position.coords.longitude, -180, 180),
+        accuracy: position.coords.accuracy ? sanitizeNumber(position.coords.accuracy, undefined, 0, 50000) : undefined,
         timestamp: Date.now()
       };
 
+      // Validate the location data before using - cast to LocationData since schema ensures correct structure
+      const validatedLocation = LocationDataSchema.parse(locationData) as LocationData;
+
       setState(prev => ({
         ...prev,
-        location: locationData,
+        location: validatedLocation,
         loading: false,
         permissionStatus: 'granted'
       }));
 
       // Store in localStorage for persistence
-      localStorage.setItem('tornadoTracker_location', JSON.stringify(locationData));
+      try {
+        localStorage.setItem('tornadoTracker_location', JSON.stringify(validatedLocation));
+      } catch (error) {
+        console.warn('Failed to store location data:', error);
+      }
 
-      return locationData;
+      return validatedLocation;
     } catch (error: any) {
       let errorMessage = 'Failed to get your location';
       let permissionStatus: LocationState['permissionStatus'] = 'unknown';
@@ -99,23 +107,29 @@ export const useLocation = () => {
   };
 
   const loadStoredLocation = () => {
-    try {
-      const stored = localStorage.getItem('tornadoTracker_location');
-      if (stored) {
-        const locationData = JSON.parse(stored) as LocationData;
-        // Check if stored location is less than 1 hour old
-        if (Date.now() - locationData.timestamp < 3600000) {
-          setState(prev => ({
-            ...prev,
-            location: locationData,
-            permissionStatus: 'granted'
-          }));
-          return locationData;
-        }
+    const fallbackLocation = null;
+    
+    const locationData = validateAndSanitizeStoredData(
+      'tornadoTracker_location',
+      LocationDataSchema,
+      fallbackLocation
+    );
+    
+    if (locationData) {
+      // Check if stored location is less than 1 hour old
+      if (Date.now() - locationData.timestamp < 3600000) {
+        setState(prev => ({
+          ...prev,
+          location: locationData,
+          permissionStatus: 'granted'
+        }));
+        return locationData;
+      } else {
+        // Remove stale location data
+        localStorage.removeItem('tornadoTracker_location');
       }
-    } catch (error) {
-      console.error('Failed to load stored location:', error);
     }
+    
     return null;
   };
 

@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query';
 import { WeatherAlert, weatherService } from '@/services/weatherService';
 import { LocationData } from './useLocation';
 import { toast } from '@/hooks/use-toast';
+import { AlertSettingsSchema, validateAndSanitizeStoredData, sanitizeNumber } from '@/lib/validation';
 
 export interface AlertSettings {
   radius: number; // miles
@@ -20,31 +21,44 @@ const DEFAULT_SETTINGS: AlertSettings = {
   severityThreshold: 'moderate'
 };
 
+// Helper to convert settings for storage/validation
+const settingsToStorable = (settings: AlertSettings) => ({
+  ...settings,
+  enabledCategories: Array.from(settings.enabledCategories)
+});
+
+const storableToSettings = (storable: any): AlertSettings => ({
+  ...DEFAULT_SETTINGS,
+  ...storable,
+  enabledCategories: new Set(storable.enabledCategories || DEFAULT_SETTINGS.enabledCategories)
+});
+
 export const useWeatherAlerts = (location: LocationData | null) => {
   const [settings, setSettings] = useState<AlertSettings>(() => {
-    try {
-      const stored = localStorage.getItem('tornadoTracker_alertSettings');
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        return {
-          ...DEFAULT_SETTINGS,
-          ...parsed,
-          enabledCategories: new Set(parsed.enabledCategories || DEFAULT_SETTINGS.enabledCategories)
-        };
-      }
-    } catch (error) {
-      console.error('Failed to load alert settings:', error);
-    }
-    return DEFAULT_SETTINGS;
+    const validatedSettings = validateAndSanitizeStoredData(
+      'tornadoTracker_alertSettings',
+      AlertSettingsSchema,
+      settingsToStorable(DEFAULT_SETTINGS)
+    );
+    
+    return storableToSettings(validatedSettings);
   });
 
   const [dismissedAlerts, setDismissedAlerts] = useState<Set<string>>(() => {
     try {
       const stored = localStorage.getItem('tornadoTracker_dismissedAlerts');
-      return stored ? new Set(JSON.parse(stored)) : new Set();
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        // Validate that it's an array of strings
+        if (Array.isArray(parsed) && parsed.every(item => typeof item === 'string' && item.length > 0)) {
+          return new Set(parsed.slice(0, 1000)); // Limit to 1000 dismissed alerts
+        }
+      }
     } catch (error) {
-      return new Set();
+      console.warn('Failed to load dismissed alerts:', error);
+      localStorage.removeItem('tornadoTracker_dismissedAlerts');
     }
+    return new Set();
   });
 
   // Query for active alerts
@@ -122,28 +136,58 @@ export const useWeatherAlerts = (location: LocationData | null) => {
 
   const updateSettings = useCallback((newSettings: Partial<AlertSettings>) => {
     const updated = { ...settings, ...newSettings };
+    
+    // Sanitize radius value
+    if (newSettings.radius !== undefined) {
+      updated.radius = sanitizeNumber(newSettings.radius, 25, 1, 1000);
+    }
+    
     setSettings(updated);
     
     try {
-      const toStore = {
-        ...updated,
-        enabledCategories: Array.from(updated.enabledCategories)
-      };
+      const toStore = settingsToStorable(updated);
+      // Validate before storing
+      AlertSettingsSchema.parse(toStore);
       localStorage.setItem('tornadoTracker_alertSettings', JSON.stringify(toStore));
     } catch (error) {
       console.error('Failed to save alert settings:', error);
+      toast({
+        title: "Settings Error",
+        description: "Failed to save alert settings",
+        variant: "destructive"
+      });
     }
   }, [settings]);
 
   const dismissAlert = useCallback((alertId: string) => {
+    // Validate alert ID
+    if (!alertId || typeof alertId !== 'string' || alertId.length > 100) {
+      console.warn('Invalid alert ID provided for dismissal');
+      return;
+    }
+    
     const updated = new Set(dismissedAlerts);
     updated.add(alertId);
-    setDismissedAlerts(updated);
     
-    try {
-      localStorage.setItem('tornadoTracker_dismissedAlerts', JSON.stringify(Array.from(updated)));
-    } catch (error) {
-      console.error('Failed to save dismissed alerts:', error);
+    // Limit dismissed alerts to prevent excessive memory usage
+    if (updated.size > 1000) {
+      const alertsArray = Array.from(updated);
+      const trimmed = new Set(alertsArray.slice(-900)); // Keep most recent 900
+      setDismissedAlerts(trimmed);
+      
+      try {
+        localStorage.setItem('tornadoTracker_dismissedAlerts', JSON.stringify(Array.from(trimmed)));
+      } catch (error) {
+        console.error('Failed to save dismissed alerts:', error);
+      }
+    } else {
+      setDismissedAlerts(updated);
+      
+      try {
+        localStorage.setItem('tornadoTracker_dismissedAlerts', JSON.stringify(Array.from(updated)));
+      } catch (error) {
+        console.error('Failed to save dismissed alerts:', error);
+      }
     }
   }, [dismissedAlerts]);
 

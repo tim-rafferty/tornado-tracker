@@ -1,4 +1,11 @@
 import { LocationData } from '@/hooks/useLocation';
+import { 
+  NWSAlertsResponseSchema, 
+  NWSObservationSchema, 
+  sanitizeString, 
+  sanitizeNumber,
+  RateLimiter 
+} from '@/lib/validation';
 
 export interface WeatherAlert {
   id: string;
@@ -34,9 +41,16 @@ export interface WeatherConditions {
 // National Weather Service API (Free, no API key required)
 export class NWSWeatherService {
   private baseUrl = 'https://api.weather.gov';
+  private rateLimiter = new RateLimiter(50, 60000); // 50 requests per minute
 
   async getActiveAlerts(location: LocationData): Promise<WeatherAlert[]> {
     try {
+      // Rate limiting check
+      const rateLimitKey = `alerts_${location.latitude}_${location.longitude}`;
+      if (!this.rateLimiter.canMakeRequest(rateLimitKey)) {
+        throw new Error('Rate limit exceeded for weather alerts');
+      }
+
       // Get active alerts for the location
       const response = await fetch(
         `${this.baseUrl}/alerts/active?point=${location.latitude},${location.longitude}`
@@ -46,25 +60,28 @@ export class NWSWeatherService {
         throw new Error(`NWS API error: ${response.status}`);
       }
 
-      const data = await response.json();
+      const rawData = await response.json();
       
-      return data.features?.map((alert: any) => ({
-        id: alert.id,
-        title: alert.properties.headline || alert.properties.event,
-        description: alert.properties.description,
+      // Validate API response structure
+      const validatedData = NWSAlertsResponseSchema.parse(rawData);
+      
+      return validatedData.features?.map((alert) => ({
+        id: sanitizeString(alert.id, 100),
+        title: sanitizeString(alert.properties.headline || alert.properties.event, 200),
+        description: sanitizeString(alert.properties.description, 2000),
         severity: this.mapSeverity(alert.properties.severity),
-        urgency: alert.properties.urgency?.toLowerCase() || 'unknown',
-        certainty: alert.properties.certainty?.toLowerCase() || 'unknown',
+        urgency: this.mapUrgency(alert.properties.urgency),
+        certainty: this.mapCertainty(alert.properties.certainty),
         category: this.categorizeAlert(alert.properties.event),
-        areas: alert.properties.areaDesc?.split('; ') || [],
-        effective: alert.properties.effective,
-        expires: alert.properties.expires,
-        onset: alert.properties.onset,
-        instruction: alert.properties.instruction,
+        areas: this.parseAreas(alert.properties.areaDesc),
+        effective: sanitizeString(alert.properties.effective, 50),
+        expires: sanitizeString(alert.properties.expires, 50),
+        onset: sanitizeString(alert.properties.onset, 50),
+        instruction: sanitizeString(alert.properties.instruction, 1000),
         source: 'nws' as const,
         coordinates: {
-          latitude: location.latitude,
-          longitude: location.longitude
+          latitude: sanitizeNumber(location.latitude, 0, -90, 90),
+          longitude: sanitizeNumber(location.longitude, 0, -180, 180)
         }
       })) || [];
     } catch (error) {
@@ -75,6 +92,12 @@ export class NWSWeatherService {
 
   async getCurrentConditions(location: LocationData): Promise<WeatherConditions | null> {
     try {
+      // Rate limiting check
+      const rateLimitKey = `conditions_${location.latitude}_${location.longitude}`;
+      if (!this.rateLimiter.canMakeRequest(rateLimitKey)) {
+        throw new Error('Rate limit exceeded for weather conditions');
+      }
+
       // First get the grid point for the location
       const pointResponse = await fetch(
         `${this.baseUrl}/points/${location.latitude},${location.longitude}`
@@ -85,7 +108,11 @@ export class NWSWeatherService {
       }
 
       const pointData = await pointResponse.json();
-      const stationsUrl = pointData.properties.observationStations;
+      const stationsUrl = sanitizeString(pointData.properties?.observationStations, 200);
+      
+      if (!stationsUrl) {
+        throw new Error('No observation stations URL found');
+      }
 
       // Get nearest weather station
       const stationsResponse = await fetch(stationsUrl);
@@ -95,7 +122,10 @@ export class NWSWeatherService {
         throw new Error('No weather stations found');
       }
 
-      const stationId = stationsData.features[0].properties.stationIdentifier;
+      const stationId = sanitizeString(stationsData.features[0].properties?.stationIdentifier, 20);
+      if (!stationId) {
+        throw new Error('No valid station identifier found');
+      }
       
       // Get latest observation
       const obsResponse = await fetch(
@@ -106,17 +136,20 @@ export class NWSWeatherService {
         throw new Error(`NWS Observation API error: ${obsResponse.status}`);
       }
 
-      const obsData = await obsResponse.json();
-      const props = obsData.properties;
+      const rawObsData = await obsResponse.json();
+      
+      // Validate observation data
+      const validatedData = NWSObservationSchema.parse(rawObsData);
+      const props = validatedData.properties;
 
       return {
-        temperature: this.celsiusToFahrenheit(props.temperature?.value) || 0,
-        humidity: props.relativeHumidity?.value || 0,
-        windSpeed: this.mpsToMph(props.windSpeed?.value) || 0,
-        windDirection: props.windDirection?.value || 0,
-        pressure: props.barometricPressure?.value || 0,
-        visibility: this.metersToMiles(props.visibility?.value) || 0,
-        conditions: props.textDescription || 'Unknown',
+        temperature: sanitizeNumber(this.celsiusToFahrenheit(props.temperature?.value), 0, -100, 150),
+        humidity: sanitizeNumber(props.relativeHumidity?.value, 0, 0, 100),
+        windSpeed: sanitizeNumber(this.mpsToMph(props.windSpeed?.value), 0, 0, 300),
+        windDirection: sanitizeNumber(props.windDirection?.value, 0, 0, 360),
+        pressure: sanitizeNumber(props.barometricPressure?.value, 0, 800, 1200),
+        visibility: sanitizeNumber(this.metersToMiles(props.visibility?.value), 0, 0, 50),
+        conditions: sanitizeString(props.textDescription, 100) || 'Unknown',
         timestamp: Date.now()
       };
     } catch (error) {
@@ -125,8 +158,9 @@ export class NWSWeatherService {
     }
   }
 
-  private mapSeverity(severity: string): WeatherAlert['severity'] {
-    switch (severity?.toLowerCase()) {
+  private mapSeverity(severity: string | undefined): WeatherAlert['severity'] {
+    const severityStr = sanitizeString(severity, 20).toLowerCase();
+    switch (severityStr) {
       case 'extreme': return 'extreme';
       case 'severe': return 'severe';
       case 'moderate': return 'moderate';
@@ -135,8 +169,30 @@ export class NWSWeatherService {
     }
   }
 
-  private categorizeAlert(event: string): WeatherAlert['category'] {
-    const eventLower = event?.toLowerCase() || '';
+  private mapUrgency(urgency: string | undefined): WeatherAlert['urgency'] {
+    const urgencyStr = sanitizeString(urgency, 20).toLowerCase();
+    switch (urgencyStr) {
+      case 'immediate': return 'immediate';
+      case 'expected': return 'expected';
+      case 'future': return 'future';
+      case 'past': return 'past';
+      default: return 'future';
+    }
+  }
+
+  private mapCertainty(certainty: string | undefined): WeatherAlert['certainty'] {
+    const certaintyStr = sanitizeString(certainty, 20).toLowerCase();
+    switch (certaintyStr) {
+      case 'observed': return 'observed';
+      case 'likely': return 'likely';
+      case 'possible': return 'possible';
+      case 'unlikely': return 'unlikely';
+      default: return 'unknown';
+    }
+  }
+
+  private categorizeAlert(event: string | undefined): WeatherAlert['category'] {
+    const eventLower = sanitizeString(event, 100).toLowerCase();
     
     if (eventLower.includes('tornado')) return 'tornado';
     if (eventLower.includes('thunderstorm') || eventLower.includes('severe')) return 'severe_thunderstorm';
@@ -144,6 +200,17 @@ export class NWSWeatherService {
     if (eventLower.includes('winter') || eventLower.includes('snow') || eventLower.includes('ice')) return 'winter_storm';
     
     return 'other';
+  }
+
+  private parseAreas(areaDesc: string | undefined): string[] {
+    const sanitized = sanitizeString(areaDesc, 500);
+    if (!sanitized) return [];
+    
+    return sanitized
+      .split(';')
+      .map(area => sanitizeString(area.trim(), 100))
+      .filter(area => area.length > 0)
+      .slice(0, 20); // Limit to 20 areas max
   }
 
   private celsiusToFahrenheit(celsius: number): number {
